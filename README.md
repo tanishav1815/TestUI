@@ -1,4 +1,5 @@
-# Tinder-like Swipe Starter
+# clozyt-swipe
+
 
 This workspace contains a Next.js frontend and a Flask backend to demo a Tinder-like swipe UI for products.
 
