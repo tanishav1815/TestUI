@@ -1,0 +1,8 @@
+[
+  {"id": 1, "name": "Red Sneakers", "price": "$79", "image": "https://picsum.photos/seed/1/800/600", "category": "shoes"},
+  {"id": 2, "name": "Blue Jacket", "price": "$129", "image": "https://picsum.photos/seed/2/800/600", "category": "outerwear"},
+  {"id": 3, "name": "Classic Watch", "price": "$199", "image": "https://picsum.photos/seed/3/800/600", "category": "accessories"},
+  {"id": 4, "name": "Sunglasses", "price": "$59", "image": "https://picsum.photos/seed/4/800/600", "category": "accessories"},
+  {"id": 5, "name": "Leather Bag", "price": "$249", "image": "https://picsum.photos/seed/5/800/600", "category": "bags"},
+  {"id": 6, "name": "Green Hoodie", "price": "$59", "image": "https://picsum.photos/seed/6/800/600", "category": "tops"}
+]

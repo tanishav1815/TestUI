@@ -1,0 +1,229 @@
+from flask import Flask, jsonify, request, g
+from flask_cors import CORS
+import sqlite3
+import os
+import random
+from pathlib import Path
+
+app = Flask(__name__)
+CORS(app)
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / 'app.db'
+
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(str(DB_PATH))
+        db.row_factory = sqlite3.Row
+    return db
+
+def init_db():
+    db = get_db()
+    cur = db.cursor()
+    # create tables
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS items (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price TEXT,
+        image TEXT
+    )
+    ''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS swipes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id INTEGER NOT NULL,
+        action TEXT CHECK(action IN ('like','dislike')) NOT NULL,
+        user_id TEXT,
+        item_image TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    db.commit()
+
+    # seed items if empty
+    cur.execute('SELECT COUNT(1) as c FROM items')
+    if cur.fetchone()['c'] == 0:
+        sample = [
+            (1, 'Red Sneakers', '$79', 'https://picsum.photos/seed/1/800/600'),
+            (2, 'Blue Jacket', '$129', 'https://picsum.photos/seed/2/800/600'),
+            (3, 'Classic Watch', '$199', 'https://picsum.photos/seed/3/800/600'),
+            (4, 'Sunglasses', '$59', 'https://picsum.photos/seed/4/800/600'),
+            (5, 'Leather Bag', '$249', 'https://picsum.photos/seed/5/800/600'),
+        ]
+        cur.executemany('INSERT INTO items(id,name,price,image) VALUES (?,?,?,?)', sample)
+        db.commit()
+    # create users table and seed a sample user if empty
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    db.commit()
+    cur.execute('SELECT COUNT(1) as c FROM users')
+    if cur.fetchone()['c'] == 0:
+        cur.execute('INSERT INTO users(id,name) VALUES (?,?)', ('user123','Demo User'))
+        db.commit()
+    # create products table and seed from data/products.json if present
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price TEXT,
+        image TEXT,
+        category TEXT
+    )
+    ''')
+    db.commit()
+    # try to load dataset file and upsert into products
+    data_file = BASE_DIR / 'data' / 'products.json'
+    if data_file.exists():
+        import json
+        with open(data_file, 'r') as f:
+            items = json.load(f)
+        for p in items:
+            # upsert using SQLite INSERT OR REPLACE
+            cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category) VALUES (?,?,?,?,?)',
+                        (p.get('id'), p.get('name'), p.get('price'), p.get('image'), p.get('category')))
+        db.commit()
+        # import CSVs from backend/Datasets if present
+        datasets_dir = BASE_DIR / 'Datasets'
+        if datasets_dir.exists() and datasets_dir.is_dir():
+            import csv
+            # determine current max id to generate ids when missing
+            cur.execute('SELECT IFNULL(MAX(id), 0) as m FROM products')
+            max_id = cur.fetchone()['m'] or 0
+            next_id = max_id + 1
+            for csvf in sorted(datasets_dir.glob('*.csv')):
+                with open(csvf, newline='') as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        # normalized fields
+                        pid = row.get('id') or row.get('product_id') or ''
+                        try:
+                            pid = int(pid) if str(pid).strip()!='' else None
+                        except Exception:
+                            pid = None
+                        if pid is None:
+                            pid = next_id
+                            next_id += 1
+                        name = row.get('name') or row.get('title') or f'Product {pid}'
+                        price = row.get('price') or row.get('cost') or ''
+                        image = row.get('image') or row.get('image_url') or ''
+                        category = row.get('category') or ''
+                        cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category) VALUES (?,?,?,?,?)',
+                                    (pid, name, price, image, category))
+            db.commit()
+    # sync products into items table for backward compatibility
+    cur.execute('SELECT id,name,price,image FROM products')
+    prod_rows = cur.fetchall()
+    if prod_rows:
+        # clear items and repopulate from products
+        cur.execute('DELETE FROM items')
+        cur.executemany('INSERT INTO items(id,name,price,image) VALUES (?,?,?,?)', [(r['id'], r['name'], r['price'], r['image']) for r in prod_rows])
+        db.commit()
+    # Migrate swipes table if missing new columns (user_id, item_image)
+    cur.execute("PRAGMA table_info(swipes)")
+    cols = [r['name'] for r in cur.fetchall()]
+    if 'user_id' not in cols:
+        cur.execute("ALTER TABLE swipes ADD COLUMN user_id TEXT")
+    if 'item_image' not in cols:
+        cur.execute("ALTER TABLE swipes ADD COLUMN item_image TEXT")
+    db.commit()
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+def fetch_recommendations(limit=10, user_id=None):
+        db = get_db()
+        cur = db.cursor()
+        if not user_id:
+                # Global ordering by score (likes - dislikes)
+                cur.execute('''
+                SELECT p.id, p.name, p.price, p.image, p.category,
+                    IFNULL(SUM(CASE WHEN s.action='like' THEN 1 WHEN s.action='dislike' THEN -1 ELSE 0 END), 0) as score
+                FROM products p
+                LEFT JOIN swipes s ON s.item_id = p.id
+                GROUP BY p.id
+                ORDER BY score DESC, RANDOM()
+                LIMIT ?
+                ''', (limit,))
+                rows = cur.fetchall()
+                items = [dict(r) for r in rows]
+                return items
+
+        # Personalized recommendations: combine global score, user's item score, and user's category affinity
+        cur.execute('''
+        WITH user_cat AS (
+            SELECT p.category as category, COUNT(*) as likes
+            FROM swipes s JOIN products p ON s.item_id = p.id
+            WHERE s.user_id = ? AND s.action = 'like'
+            GROUP BY p.category
+        ),
+        user_item AS (
+            SELECT item_id,
+                SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as user_score
+            FROM swipes WHERE user_id = ? GROUP BY item_id
+        ),
+        global_score AS (
+            SELECT item_id,
+                SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as gscore
+            FROM swipes GROUP BY item_id
+        )
+        SELECT p.id, p.name, p.price, p.image, p.category,
+            IFNULL(g.gscore,0) as global_score,
+            IFNULL(u.user_score,0) as user_score,
+            IFNULL(uc.likes,0) as cat_likes,
+            (IFNULL(g.gscore,0) + IFNULL(u.user_score,0)*2 + IFNULL(uc.likes,0)*1) as score
+        FROM products p
+        LEFT JOIN global_score g ON g.item_id = p.id
+        LEFT JOIN user_item u ON u.item_id = p.id
+        LEFT JOIN user_cat uc ON uc.category = p.category
+        ORDER BY score DESC, RANDOM()
+        LIMIT ?
+        ''', (user_id, user_id, limit))
+        rows = cur.fetchall()
+        items = [dict(r) for r in rows]
+        return items
+
+@app.route('/recommendations')
+def recommendations():
+    user_id = request.args.get('user_id')
+    items = fetch_recommendations(limit=10, user_id=user_id)
+    return jsonify({"items": items})
+
+@app.route('/swipe', methods=['POST'])
+def swipe():
+
+    data = request.get_json() or {}
+    action = data.get('action')
+    # Accept either { action, item } or { action, item_id, image, user_id }
+    item = data.get('item') or {}
+    item_id = item.get('id') or data.get('item_id')
+    item_image = item.get('image') or data.get('image') or data.get('item_image')
+    user_id = data.get('user_id')
+    if action not in ('like','dislike') or item_id is None:
+        return jsonify({"error":"invalid payload"}), 400
+    db = get_db()
+    cur = db.cursor()
+    cur.execute('INSERT INTO swipes(item_id, action, user_id, item_image) VALUES (?,?,?,?)', (item_id, action, user_id, item_image))
+    db.commit()
+    return jsonify({"status":"ok"})
+
+if __name__ == '__main__':
+    # ensure DB folder exists
+    os.makedirs(BASE_DIR, exist_ok=True)
+    # initialize DB if needed
+    with app.app_context():
+        init_db()
+    # allow overriding port via environment for easy local testing
+    port = int(os.getenv('PORT', '5001'))
+    host = os.getenv('HOST', '0.0.0.0')
+    debug = os.getenv('FLASK_DEBUG', '1') in ('1','true','True')
+    app.run(host=host, port=port, debug=debug)
