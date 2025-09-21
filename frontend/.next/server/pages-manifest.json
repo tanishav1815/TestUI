@@ -2,7 +2,8 @@
   "/_app": "pages/_app.js",
   "/_error": "pages/_error.js",
   "/_document": "pages/_document.js",
-  "/api/swipe": "pages/api/swipe.js",
   "/api/recommendations": "pages/api/recommendations.js",
+  "/api/swipe": "pages/api/swipe.js",
+  "/api/categories": "pages/api/categories.js",
   "/": "pages/index.js"
 }

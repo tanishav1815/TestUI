@@ -13,3 +13,18 @@ body{margin:0;font-family:Inter,system-ui,Arial,Helvetica,sans-serif;background:
 
 .overlay{position:absolute;left:16px;top:16px;padding:6px 10px;border-radius:6px;font-weight:700;color:#222;opacity:0;transition:opacity 120ms linear}
 
+.controls{display:flex;justify-content:center;gap:12px;margin-top:16px}
+.btn{padding:10px 18px;border-radius:10px;color:#fff;border:none;font-weight:700;cursor:pointer;transition:transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease}
+.btn:active{transform:scale(0.98)}
+.btn-like{background:linear-gradient(180deg,#34d399,#10b981);box-shadow:0 6px 18px rgba(16,185,129,0.18)}
+.btn-dislike{background:linear-gradient(180deg,#ff7b7b,#ff4757);box-shadow:0 6px 18px rgba(255,71,87,0.18)}
+
+/* helper for card press animation (used inline by JS) */
+.card.animate-out{transition:transform 350ms ease-out}
+
+.category-bar{display:flex;align-items:center}
+.cat{background:transparent;border:1px solid rgba(0,0,0,0.08);padding:6px 10px;border-radius:999px;cursor:pointer}
+.cat.active{background:linear-gradient(180deg,#eef9f6,#d1fae5);border-color:rgba(16,185,129,0.2)}
+
+
+

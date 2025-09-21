@@ -74,9 +74,31 @@ def init_db():
         name TEXT NOT NULL,
         price TEXT,
         image TEXT,
-        category TEXT
+        category TEXT,
+        color TEXT,
+        location TEXT,
+        price_num REAL
     )
     ''')
+    db.commit()
+    # Ensure products table has new columns if upgrading old DB
+    cur.execute("PRAGMA table_info(products)")
+    prod_cols = [r['name'] for r in cur.fetchall()]
+    if 'color' not in prod_cols:
+        try:
+            cur.execute("ALTER TABLE products ADD COLUMN color TEXT")
+        except Exception:
+            pass
+    if 'location' not in prod_cols:
+        try:
+            cur.execute("ALTER TABLE products ADD COLUMN location TEXT")
+        except Exception:
+            pass
+    if 'price_num' not in prod_cols:
+        try:
+            cur.execute("ALTER TABLE products ADD COLUMN price_num REAL")
+        except Exception:
+            pass
     db.commit()
     # try to load dataset file and upsert into products
     data_file = BASE_DIR / 'data' / 'products.json'
@@ -86,8 +108,26 @@ def init_db():
             items = json.load(f)
         for p in items:
             # upsert using SQLite INSERT OR REPLACE
-            cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category) VALUES (?,?,?,?,?)',
-                        (p.get('id'), p.get('name'), p.get('price'), p.get('image'), p.get('category')))
+            # parse numeric price if available
+            def parse_price_num(val):
+                try:
+                    if val is None:
+                        return None
+                    s = str(val).strip()
+                    # remove common currency symbols and commas
+                    s = s.replace('$','').replace('₹','').replace('£','').replace(',','')
+                    # keep digits and dot
+                    import re
+                    m = re.findall(r"[0-9]+(?:\.[0-9]+)?", s)
+                    if not m:
+                        return None
+                    return float(m[0])
+                except Exception:
+                    return None
+
+            price_num = parse_price_num(p.get('price'))
+            cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category,color,location,price_num) VALUES (?,?,?,?,?,?,?,?)',
+                        (p.get('id'), p.get('name'), p.get('price'), p.get('image'), p.get('category'), p.get('color'), p.get('location'), price_num))
         db.commit()
         # import CSVs from backend/Datasets if present
         datasets_dir = BASE_DIR / 'Datasets'
@@ -114,9 +154,28 @@ def init_db():
                         price = row.get('price') or row.get('cost') or ''
                         image = row.get('image') or row.get('image_url') or ''
                         category = row.get('category') or ''
-                        cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category) VALUES (?,?,?,?,?)',
-                                    (pid, name, price, image, category))
+                        color = row.get('color') or ''
+                        location = row.get('location') or ''
+                        # parse numeric price
+                        def parse_price_num_local(val):
+                            try:
+                                if val is None:
+                                    return None
+                                s = str(val).strip()
+                                s = s.replace('$','').replace('₹','').replace('£','').replace(',','')
+                                import re
+                                m = re.findall(r"[0-9]+(?:\.[0-9]+)?", s)
+                                if not m:
+                                    return None
+                                return float(m[0])
+                            except Exception:
+                                return None
+
+                        price_num = parse_price_num_local(price)
+                        cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category,color,location,price_num) VALUES (?,?,?,?,?,?,?,?)',
+                                    (pid, name, price, image, category, color, location, price_num))
             db.commit()
+    
     # sync products into items table for backward compatibility
     cur.execute('SELECT id,name,price,image FROM products')
     prod_rows = cur.fetchall()
@@ -140,63 +199,124 @@ def close_connection(exception):
     if db is not None:
         db.close()
 
-def fetch_recommendations(limit=10, user_id=None):
-        db = get_db()
-        cur = db.cursor()
-        if not user_id:
-                # Global ordering by score (likes - dislikes)
-                cur.execute('''
-                SELECT p.id, p.name, p.price, p.image, p.category,
-                    IFNULL(SUM(CASE WHEN s.action='like' THEN 1 WHEN s.action='dislike' THEN -1 ELSE 0 END), 0) as score
-                FROM products p
-                LEFT JOIN swipes s ON s.item_id = p.id
-                GROUP BY p.id
-                ORDER BY score DESC, RANDOM()
-                LIMIT ?
-                ''', (limit,))
-                rows = cur.fetchall()
-                items = [dict(r) for r in rows]
-                return items
+def fetch_recommendations(limit=10, user_id=None, category=None, color=None, location=None, min_price=None, max_price=None):
+    db = get_db()
+    cur = db.cursor()
+    # Common filters: category, color, location, min_price, max_price
+    def build_filters(category, color, location, min_price, max_price):
+        clauses = []
+        params = []
+        if category:
+            clauses.append('p.category = ?')
+            params.append(category)
+        if color:
+            clauses.append('p.color = ?')
+            params.append(color)
+        if location:
+            clauses.append('p.location = ?')
+            params.append(location)
+        if min_price is not None:
+            clauses.append('p.price_num >= ?')
+            params.append(min_price)
+        if max_price is not None:
+            clauses.append('p.price_num <= ?')
+            params.append(max_price)
+        if clauses:
+            return 'WHERE ' + ' AND '.join(clauses), tuple(params)
+        return '', ()
 
-        # Personalized recommendations: combine global score, user's item score, and user's category affinity
-        cur.execute('''
-        WITH user_cat AS (
-            SELECT p.category as category, COUNT(*) as likes
-            FROM swipes s JOIN products p ON s.item_id = p.id
-            WHERE s.user_id = ? AND s.action = 'like'
-            GROUP BY p.category
-        ),
-        user_item AS (
-            SELECT item_id,
-                SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as user_score
-            FROM swipes WHERE user_id = ? GROUP BY item_id
-        ),
-        global_score AS (
-            SELECT item_id,
-                SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as gscore
-            FROM swipes GROUP BY item_id
-        )
-        SELECT p.id, p.name, p.price, p.image, p.category,
-            IFNULL(g.gscore,0) as global_score,
-            IFNULL(u.user_score,0) as user_score,
-            IFNULL(uc.likes,0) as cat_likes,
-            (IFNULL(g.gscore,0) + IFNULL(u.user_score,0)*2 + IFNULL(uc.likes,0)*1) as score
+    # Build filters using passed parameters
+    filter_where, filter_params = build_filters(category, color, location, min_price, max_price)
+
+    if not user_id:
+        # Global ordering by score (likes - dislikes)
+        sql = f'''
+        SELECT p.id, p.name, p.price, p.image, p.category, p.color, p.location, p.price_num,
+            IFNULL(SUM(CASE WHEN s.action='like' THEN 1 WHEN s.action='dislike' THEN -1 ELSE 0 END), 0) as score
         FROM products p
-        LEFT JOIN global_score g ON g.item_id = p.id
-        LEFT JOIN user_item u ON u.item_id = p.id
-        LEFT JOIN user_cat uc ON uc.category = p.category
+        LEFT JOIN swipes s ON s.item_id = p.id
+        {filter_where}
+        GROUP BY p.id
         ORDER BY score DESC, RANDOM()
         LIMIT ?
-        ''', (user_id, user_id, limit))
+        '''
+        params = tuple(filter_params) + (limit,)
+        cur.execute(sql, params)
         rows = cur.fetchall()
         items = [dict(r) for r in rows]
         return items
 
+    # Personalized recommendations: combine global score, user's item score, and user's category affinity
+    # Apply same filters as global selection
+    filter_where_personal = filter_where
+
+    sql = f'''
+    WITH user_cat AS (
+        SELECT p.category as category, COUNT(*) as likes
+        FROM swipes s JOIN products p ON s.item_id = p.id
+        WHERE s.user_id = ? AND s.action = 'like'
+        GROUP BY p.category
+    ),
+    user_item AS (
+        SELECT item_id,
+            SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as user_score
+        FROM swipes WHERE user_id = ? GROUP BY item_id
+    ),
+    global_score AS (
+        SELECT item_id,
+            SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as gscore
+        FROM swipes GROUP BY item_id
+    )
+    SELECT p.id, p.name, p.price, p.image, p.category,
+        IFNULL(g.gscore,0) as global_score,
+        IFNULL(u.user_score,0) as user_score,
+        IFNULL(uc.likes,0) as cat_likes,
+        (IFNULL(g.gscore,0) + IFNULL(u.user_score,0)*2 + IFNULL(uc.likes,0)*1) as score
+    FROM products p
+    LEFT JOIN global_score g ON g.item_id = p.id
+    LEFT JOIN user_item u ON u.item_id = p.id
+    LEFT JOIN user_cat uc ON uc.category = p.category
+    {filter_where_personal}
+    ORDER BY score DESC, RANDOM()
+    LIMIT ?
+    '''
+    params = [user_id, user_id]
+    # append filter params in same order as build_filters returned
+    if filter_params:
+        params.extend(filter_params)
+    params.append(limit)
+    params = tuple(params)
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    items = [dict(r) for r in rows]
+    return items
+
 @app.route('/recommendations')
 def recommendations():
     user_id = request.args.get('user_id')
-    items = fetch_recommendations(limit=10, user_id=user_id)
+    category = request.args.get('category')
+    color = request.args.get('color')
+    location = request.args.get('location')
+    try:
+        min_price = float(request.args.get('min_price')) if request.args.get('min_price') is not None else None
+    except Exception:
+        min_price = None
+    try:
+        max_price = float(request.args.get('max_price')) if request.args.get('max_price') is not None else None
+    except Exception:
+        max_price = None
+    items = fetch_recommendations(limit=10, user_id=user_id, category=category, color=color, location=location, min_price=min_price, max_price=max_price)
     return jsonify({"items": items})
+
+
+@app.route('/categories')
+def categories():
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category <> '' ORDER BY category")
+    rows = cur.fetchall()
+    cats = [r['category'] for r in rows]
+    return jsonify({"categories": cats})
 
 @app.route('/swipe', methods=['POST'])
 def swipe():
