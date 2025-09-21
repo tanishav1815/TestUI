@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import useSWR from 'swr'
 
 const fetcher = (url) => fetch(url).then(r=>r.json())
+// When running locally, allow the client to call the Flask backend directly
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:5001'
 
-function Card({ item, onSwipe }){
+function Card({ item, onSwipe, favorites, toggleFavorite }){
   const ref = useRef()
   const pos = useRef({x:0,y:0})
       const overlayRef = useRef()
@@ -72,6 +74,7 @@ function Card({ item, onSwipe }){
 
   return (
     <div ref={ref} className="card">
+          <button className={`fav ${favorites && favorites.includes(item.id)? 'active':''}`} onClick={(e)=>{ e.stopPropagation(); toggleFavorite(item.id) }}>{favorites && favorites.includes(item.id)? '★' : '☆'}</button>
           <div className="overlay" ref={overlayRef} />
       <img src={item.image} alt={item.name} />
       <div className="meta">
@@ -97,12 +100,32 @@ export default function Home(){
     if(minPriceFilter) params.set('min_price', minPriceFilter)
     if(maxPriceFilter) params.set('max_price', maxPriceFilter)
     const qs = params.toString()
-    return `/api/recommendations${qs? '?'+qs : ''}`
+    // call backend directly from the browser (avoids server-side proxy issues)
+    return `${BACKEND}/recommendations${qs? '?'+qs : ''}`
   }
   const {data, error, mutate} = useSWR(swrKey, fetcher, {refreshInterval:0})
-  const {data:catData} = useSWR('/api/categories', fetcher)
+  const {data:catData} = useSWR(`${BACKEND}/categories`, fetcher)
   const [stack, setStack] = useState([])
   const deckRef = useRef()
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [moreRecs, setMoreRecs] = useState([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [moreRecsLoading, setMoreRecsLoading] = useState(false)
+  const [favorites, setFavorites] = useState(() => {
+    try{ return JSON.parse(localStorage.getItem('favorites')||'[]') }catch(e){ return [] }
+  })
+  useEffect(()=>{
+    try{ const saved = JSON.parse(localStorage.getItem('favorites')||'[]'); setFavorites(saved) }catch(e){}
+  },[])
+
+  function toggleFavorite(id){
+    setFavorites(prev => {
+      const next = prev.includes(id) ? prev.filter(x=>x!==id) : prev.concat([id])
+      try{ localStorage.setItem('favorites', JSON.stringify(next)) }catch(e){}
+      return next
+    })
+  }
 
   useEffect(()=>{
     // only update stack when data.items is an array
@@ -119,12 +142,50 @@ export default function Home(){
   async function handleSwipe(action, item){
     // send to backend
     try{
-      await fetch('/api/swipe', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({action, user_id: USER_ID, item_id: item.id, image: item.image})})
+      const resp = await fetch(`${BACKEND}/swipe`, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({action, user_id: USER_ID, item_id: item.id, image: item.image})})
+      // if backend returns recommendations, push them to top of stack
+      if(resp && resp.ok){
+        const body = await resp.json()
+        if(body && Array.isArray(body.recommendations) && body.recommendations.length>0){
+          setStack(s => {
+            const curr = Array.isArray(s)? s : []
+            // prepend new recommendations while keeping the remaining
+            return body.recommendations.concat(curr.slice(1))
+          })
+        }
+      }
     }catch(e){
       console.error(e)
     }
     // remove top item
     setStack(s => Array.isArray(s) ? s.slice(1) : [])
+  }
+
+  async function doSearch(){
+    if(!searchQuery) return setSearchResults([])
+    setSearchLoading(true)
+    try{
+  const res = await fetch(`${BACKEND}/search?q=${encodeURIComponent(searchQuery)}&color=${encodeURIComponent(colorFilter||'')}&location=${encodeURIComponent(locationFilter||'')}`)
+      const data = await res.json()
+      setSearchResults(Array.isArray(data.items)? data.items : [])
+    }catch(e){
+      console.error(e)
+    }finally{
+      setSearchLoading(false)
+    }
+  }
+
+  async function loadSimilar(product_id){
+    setMoreRecsLoading(true)
+    try{
+  const res = await fetch(`${BACKEND}/similar?product_id=${product_id}&k=8`)
+      const data = await res.json()
+      setMoreRecs(Array.isArray(data.items)? data.items : [])
+    }catch(e){
+      console.error(e)
+    }finally{
+      setMoreRecsLoading(false)
+    }
   }
 
   function doButtonSwipe(action){
@@ -172,11 +233,62 @@ export default function Home(){
         <button onClick={()=>{ setSelectedCategory(''); setColorFilter(''); setLocationFilter(''); setMinPriceFilter(''); setMaxPriceFilter(''); mutate(); }}>Clear Filters</button>
       </div>
       <h1>Product Swipe</h1>
+      <div style={{display:'flex',gap:12,marginBottom:12,alignItems:'center'}}>
+        <input placeholder="Search products" value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} style={{flex:1}} />
+        <button onClick={doSearch}>Search</button>
+      </div>
       <div className="deck" ref={deckRef}>
         {(Array.isArray(stack) && stack.length===0) && <p>Loading or no more items</p>}
         {(Array.isArray(stack) ? stack.slice(0,3) : []).map((it,idx)=> (
-          <Card key={it.id} item={it} onSwipe={handleSwipe} />
+          <Card key={it.id} item={it} onSwipe={handleSwipe} favorites={favorites} toggleFavorite={toggleFavorite} />
         ))}
+      </div>
+      <div style={{marginTop:12}}>
+        <h3>More Recommendations</h3>
+        <div style={{display:'flex',gap:8,overflowX:'auto',padding:'8px 0'}}>
+          {moreRecsLoading && <div className="spinner" />}
+          {moreRecs.map(m=> (
+            <div key={m.id} style={{width:140,minWidth:140,cursor:'pointer',position:'relative'}}>
+              <div style={{position:'relative'}} onClick={()=>{
+                // put selected similar item on top of stack and load more similar
+                setStack(s => [m].concat(Array.isArray(s)?s:[]))
+                loadSimilar(m.id)
+              }}>
+                <img src={m.image} alt={m.name} style={{width:'100%',height:100,objectFit:'cover',borderRadius:6}} />
+              </div>
+              <button className={`fav ${favorites.includes(m.id)? 'active':''}`} onClick={(evt)=>{ evt.stopPropagation(); toggleFavorite(m.id) }}>
+                {favorites.includes(m.id)? '★' : '☆'}
+              </button>
+              <div style={{fontSize:12}}>{m.name}</div>
+              <div style={{fontSize:11,color:'#666'}}>{m.price}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{marginTop:12}}>
+        {searchResults.length>0 && (
+          <div>
+            <h3>Search Results</h3>
+            <div>
+              {searchLoading && <div style={{display:'flex',justifyContent:'center',padding:12}}><div className="spinner" /></div>}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(180px,1fr))',gap:12}}>
+                {searchResults.map(s=> (
+                  <div key={s.id} className="result-card" style={{position:'relative'}} onClick={()=>{
+                    // push selected search item to top of stack and fetch similar
+                    setStack(curr => [s].concat(Array.isArray(curr)?curr:[]))
+                    loadSimilar(s.id)
+                  }}>
+                    <img src={s.image} alt={s.name} className="thumb" />
+                    <button className={`fav ${favorites.includes(s.id)? 'active':''}`} onClick={(evt)=>{ evt.stopPropagation(); toggleFavorite(s.id) }}>{favorites.includes(s.id)? '★' : '☆'}</button>
+                    <div style={{fontWeight:600}}>{s.name}</div>
+                    <div style={{color:'#666'}}>{s.price}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
       <div className="controls">
         <button className="btn btn-dislike" aria-label="dislike" onClick={()=>doButtonSwipe('dislike')}>Nope</button>

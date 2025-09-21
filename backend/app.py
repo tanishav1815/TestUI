@@ -4,6 +4,28 @@ import sqlite3
 import os
 import random
 from pathlib import Path
+# image_based_recommender uses numpy, keras, etc. Make import optional so the
+# server can start even if those heavy dependencies aren't installed in dev.
+try:
+    from Models import image_based_recommendation
+except Exception as e:
+    image_based_recommendation = None
+    print('Warning: image_based_recommendation disabled -', e)
+
+# NLP recommender (optional) - similar opt-in import
+try:
+    from Models.nlp_recommender import NLPRecommender
+    try:
+        _nlp = NLPRecommender()
+    except Exception as _e:
+        print('Warning: failed to instantiate NLPRecommender -', _e)
+        _nlp = None
+except Exception as e:
+    _nlp = None
+    # keep going if sentence-transformers not installed
+    print('Warning: NLP recommender disabled -', e)
+
+import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -41,6 +63,16 @@ def init_db():
     )
     ''')
     db.commit()
+    # Create indexes to speed up searches
+    try:
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_color ON products(color)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_location ON products(location)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_price_num ON products(price_num)')
+        db.commit()
+    except Exception:
+        pass
 
     # seed items if empty
     cur.execute('SELECT COUNT(1) as c FROM items')
@@ -133,11 +165,28 @@ def init_db():
         datasets_dir = BASE_DIR / 'Datasets'
         if datasets_dir.exists() and datasets_dir.is_dir():
             import csv
+            # bookkeeping table to avoid re-importing the same file repeatedly
+            cur.execute('CREATE TABLE IF NOT EXISTS imported_files (filename TEXT PRIMARY KEY, mtime REAL)')
+            db.commit()
             # determine current max id to generate ids when missing
             cur.execute('SELECT IFNULL(MAX(id), 0) as m FROM products')
             max_id = cur.fetchone()['m'] or 0
             next_id = max_id + 1
             for csvf in sorted(datasets_dir.glob('*.csv')):
+                try:
+                    mtime = csvf.stat().st_mtime
+                except Exception:
+                    mtime = None
+                # skip file if it was already imported with same mtime
+                skip_file = False
+                if mtime is not None:
+                    cur.execute('SELECT mtime FROM imported_files WHERE filename = ?', (csvf.name,))
+                    row_m = cur.fetchone()
+                    if row_m and row_m['mtime'] == mtime:
+                        skip_file = True
+                if skip_file:
+                    continue
+
                 with open(csvf, newline='') as fh:
                     reader = csv.DictReader(fh)
                     for row in reader:
@@ -147,15 +196,13 @@ def init_db():
                             pid = int(pid) if str(pid).strip()!='' else None
                         except Exception:
                             pid = None
-                        if pid is None:
-                            pid = next_id
-                            next_id += 1
-                        name = row.get('name') or row.get('title') or f'Product {pid}'
+                        name = row.get('name') or row.get('title') or ''
                         price = row.get('price') or row.get('cost') or ''
-                        image = row.get('image') or row.get('image_url') or ''
+                        image = (row.get('image') or row.get('image_url') or '').strip()
                         category = row.get('category') or ''
                         color = row.get('color') or ''
                         location = row.get('location') or ''
+
                         # parse numeric price
                         def parse_price_num_local(val):
                             try:
@@ -172,9 +219,33 @@ def init_db():
                                 return None
 
                         price_num = parse_price_num_local(price)
+
+                        # if pid not provided, try to find an existing product by image or exact name+price
+                        if pid is None:
+                            pid = None
+                            if image:
+                                cur.execute('SELECT id FROM products WHERE image = ? LIMIT 1', (image,))
+                                prow = cur.fetchone()
+                                if prow:
+                                    pid = prow['id']
+                            if pid is None and name:
+                                cur.execute('SELECT id FROM products WHERE name = ? AND price = ? LIMIT 1', (name, price))
+                                prow = cur.fetchone()
+                                if prow:
+                                    pid = prow['id']
+                            if pid is None:
+                                pid = next_id
+                                next_id += 1
+
                         cur.execute('INSERT OR REPLACE INTO products(id,name,price,image,category,color,location,price_num) VALUES (?,?,?,?,?,?,?,?)',
-                                    (pid, name, price, image, category, color, location, price_num))
-            db.commit()
+                                    (pid, name or f'Product {pid}', price, image, category, color, location, price_num))
+
+                # record the import so we won't reprocess unchanged files
+                try:
+                    cur.execute('INSERT OR REPLACE INTO imported_files(filename, mtime) VALUES (?,?)', (csvf.name, mtime))
+                    db.commit()
+                except Exception:
+                    db.commit()
     
     # sync products into items table for backward compatibility
     cur.execute('SELECT id,name,price,image FROM products')
@@ -318,6 +389,88 @@ def categories():
     cats = [r['category'] for r in rows]
     return jsonify({"categories": cats})
 
+
+@app.route('/search')
+def search():
+    q = (request.args.get('q') or '').strip()
+    color = request.args.get('color')
+    location = request.args.get('location')
+    try:
+        min_price = float(request.args.get('min_price')) if request.args.get('min_price') is not None else None
+    except Exception:
+        min_price = None
+    try:
+        max_price = float(request.args.get('max_price')) if request.args.get('max_price') is not None else None
+    except Exception:
+        max_price = None
+
+    db = get_db()
+    cur = db.cursor()
+    clauses = []
+    params = []
+    if q:
+        clauses.append("(name LIKE ? OR category LIKE ? OR color LIKE ? OR location LIKE ?)")
+        like_q = f"%{q}%"
+        params.extend([like_q, like_q, like_q, like_q])
+    if color:
+        clauses.append('color = ?')
+        params.append(color)
+    if location:
+        clauses.append('location = ?')
+        params.append(location)
+    if min_price is not None:
+        clauses.append('price_num >= ?')
+        params.append(min_price)
+    if max_price is not None:
+        clauses.append('price_num <= ?')
+        params.append(max_price)
+
+    where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+    sql = f"SELECT id, name, price, image, category, color, location, price_num FROM products {where} LIMIT 50"
+    cur.execute(sql, tuple(params))
+    rows = cur.fetchall()
+    items = [dict(r) for r in rows]
+    return jsonify({"items": items})
+
+
+@app.route('/similar')
+def similar():
+    # expect ?product_id=123 or ?image_url=...
+    product_id = request.args.get('product_id')
+    image_url = request.args.get('image_url')
+    top_k = int(request.args.get('k') or 6)
+    db = get_db()
+    cur = db.cursor()
+    if product_id:
+        cur.execute('SELECT image FROM products WHERE id = ?', (product_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"items": []})
+        image_url = row['image']
+    if not image_url:
+        return jsonify({"items": []})
+
+    # use image recommender (if available). If the model isn't importable
+    # (missing dependencies like numpy/keras), return an empty list so the
+    # rest of the API continues to work.
+    if image_based_recommendation is None:
+        return jsonify({"items": []}), 503
+    try:
+        recs = image_based_recommendation.recommend_from_image(image_url, top_k=top_k)
+        # recs is list of {product_id, name, image_url}
+        # augment with product DB fields where possible
+        out = []
+        for r in recs:
+            pid = r.get('product_id')
+            cur.execute('SELECT id, name, price, image, category FROM products WHERE id = ?', (pid,))
+            prow = cur.fetchone()
+            if prow:
+                out.append(dict(prow))
+        return jsonify({"items": out})
+    except Exception as e:
+        print('similar error', e)
+        return jsonify({"items": []}), 500
+
 @app.route('/swipe', methods=['POST'])
 def swipe():
 
@@ -334,7 +487,129 @@ def swipe():
     cur = db.cursor()
     cur.execute('INSERT INTO swipes(item_id, action, user_id, item_image) VALUES (?,?,?,?)', (item_id, action, user_id, item_image))
     db.commit()
+
+    # Run image-based recommender (ensure features exist). If the image-based
+    # module is available, ensure feature cache is present; generate in a
+    # background thread if extraction may take long so we don't block the swipe.
+    image_recs = []
+    nlp_recs = []
+    try:
+        if image_based_recommendation is not None:
+            # ensure feature cache exists; run in background if missing
+            def ensure_and_run():
+                try:
+                    image_based_recommendation.ensure_features_exist()
+                except Exception as _:
+                    pass
+            # start background sync (non-blocking)
+            t = threading.Thread(target=ensure_and_run, daemon=True)
+            t.start()
+            # attempt a best-effort recommend from the swiped item's image
+            cur.execute('SELECT image FROM products WHERE id = ?', (item_id,))
+            prow = cur.fetchone()
+            if prow and prow['image']:
+                try:
+                    image_recs = image_based_recommendation.recommend_from_image(prow['image'], top_k=6)
+                except Exception as e:
+                    print('image recommender error on swipe:', e)
+
+        # NLP recommender: attempt to call with product name/category/description
+        if _nlp is not None:
+            cur.execute('SELECT name, category FROM products WHERE id = ?', (item_id,))
+            prow = cur.fetchone()
+            if prow:
+                query_text = f"{prow['name']} {prow.get('category','')}"
+                try:
+                    nlp_results = _nlp.nlp_recommend(query_text, top_k=6, user_id=user_id)
+                    nlp_recs = nlp_results
+                except Exception as e:
+                    print('nlp recommender error on swipe:', e)
+    except Exception as e:
+        print('recommender error on swipe:', e)
+
+    # Combine and dedupe recommendations (image-based returns product_id; NLP returns product dicts)
+    combined = []
+    seen = set()
+    for r in (image_recs or []):
+        pid = r.get('product_id')
+        if pid and pid not in seen and pid != item_id:
+            cur.execute('SELECT id,name,price,image,category FROM products WHERE id = ?', (pid,))
+            prow = cur.fetchone()
+            if prow:
+                combined.append(dict(prow))
+                seen.add(pid)
+    for r in (nlp_recs or []):
+        pid = r.get('id') or r.get('product_id')
+        if pid and pid not in seen and pid != item_id:
+            # if NLP returns product dicts with id use those; otherwise try to lookup by name
+            if 'id' in r:
+                cur.execute('SELECT id,name,price,image,category FROM products WHERE id = ?', (r['id'],))
+                prow = cur.fetchone()
+                if prow:
+                    combined.append(dict(prow))
+                    seen.add(r['id'])
+            else:
+                # fallback: match by name
+                cur.execute('SELECT id,name,price,image,category FROM products WHERE name = ? LIMIT 1', (r.get('name') or r.get('title'),))
+                prow = cur.fetchone()
+                if prow and prow['id'] not in seen:
+                    combined.append(dict(prow))
+                    seen.add(prow['id'])
+
+    return jsonify({"status":"ok","recommendations": combined})
+
+
+@app.route('/admin/extract_features', methods=['POST'])
+def admin_extract_features():
+    """Admin endpoint to synchronously extract image features from products DB.
+    Use after installing heavy deps (tensorflow, pillow, sklearn, pandas).
+    """
+    if image_based_recommendation is None:
+        return jsonify({"error":"image_recommender_unavailable"}), 503
+    try:
+        # If image recommender available, start extraction in background (non-blocking)
+        def run_extract():
+            try:
+                image_based_recommendation.extract_all_features_from_db()
+            except Exception as ee:
+                print('background extract error', ee)
+        t = threading.Thread(target=run_extract, daemon=True)
+        t.start()
+        return jsonify({"status":"started"})
+    except Exception as e:
+        print('admin extract error', e)
+        return jsonify({"error":"extract_failed","message": str(e)}), 500
+
+
+@app.route('/admin/generate_nlp', methods=['POST'])
+def admin_generate_nlp():
+    """Admin endpoint to (re)generate NLP embeddings using sentence-transformers.
+    """
+    global _nlp
+    if _nlp is None:
+        try:
+            from Models.nlp_recommender import NLPRecommender
+            _nlp = NLPRecommender()
+        except Exception as e:
+            print('admin nlp error', e)
+            return jsonify({"error":"nlp_unavailable","message": str(e)}), 503
     return jsonify({"status":"ok"})
+
+
+@app.route('/admin/extract_progress')
+def admin_extract_progress():
+    """Return progress info written by image recommender to progress JSON file."""
+    prog_path = Path(__file__).resolve().parent / 'Models' / 'feature_progress.json'
+    if not prog_path.exists():
+        return jsonify({"status":"idle"})
+    try:
+        import json
+        with open(prog_path, 'r') as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        print('progress read error', e)
+        return jsonify({"status":"unknown"}), 500
 
 if __name__ == '__main__':
     # ensure DB folder exists

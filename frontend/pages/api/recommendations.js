@@ -1,5 +1,7 @@
 export default async function handler(req, res){
-  const backend = process.env.BACKEND_URL || 'http://localhost:5001'
+  // prefer explicit addresses to avoid localhost/IPv6 issues. Allow BACKEND_URL env
+  // to override. If not set, try 127.0.0.1 then the LAN IP observed on dev machine.
+  const backend = process.env.BACKEND_URL || 'http://127.0.0.1:5001' || 'http://10.157.205.243:5001'
   try{
     const qs = new URLSearchParams()
   if(req.query.user_id) qs.set('user_id', req.query.user_id)
@@ -15,6 +17,7 @@ export default async function handler(req, res){
   }catch(err){
     console.error('Error proxying /recommendations to backend', err)
     const message = err && err.message ? err.message : String(err)
+    // include stack in logs and return a concise error to the client
     return res.status(502).json({ error: 'backend_unavailable', message })
   }
 }
