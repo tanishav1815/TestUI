@@ -4,6 +4,8 @@ import sqlite3
 import os
 import random
 from pathlib import Path
+from uuid import uuid4
+from Models.image_based_recommendation import recommend_from_image
 # image_based_recommender uses numpy, keras, etc. Make import optional so the
 # server can start even if those heavy dependencies aren't installed in dev.
 try:
@@ -63,29 +65,7 @@ def init_db():
     )
     ''')
     db.commit()
-    # Create indexes to speed up searches
-    try:
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_color ON products(color)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_location ON products(location)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_products_price_num ON products(price_num)')
-        db.commit()
-    except Exception:
-        pass
-
-    # seed items if empty
-    cur.execute('SELECT COUNT(1) as c FROM items')
-    if cur.fetchone()['c'] == 0:
-        sample = [
-            (1, 'Red Sneakers', '$79', 'https://picsum.photos/seed/1/800/600'),
-            (2, 'Blue Jacket', '$129', 'https://picsum.photos/seed/2/800/600'),
-            (3, 'Classic Watch', '$199', 'https://picsum.photos/seed/3/800/600'),
-            (4, 'Sunglasses', '$59', 'https://picsum.photos/seed/4/800/600'),
-            (5, 'Leather Bag', '$249', 'https://picsum.photos/seed/5/800/600'),
-        ]
-        cur.executemany('INSERT INTO items(id,name,price,image) VALUES (?,?,?,?)', sample)
-        db.commit()
+    # Remove hardcoded index creation and sample items insert
     # create users table and seed a sample user if empty
     cur.execute('''
     CREATE TABLE IF NOT EXISTS users (
@@ -129,6 +109,11 @@ def init_db():
     if 'price_num' not in prod_cols:
         try:
             cur.execute("ALTER TABLE products ADD COLUMN price_num REAL")
+        except Exception:
+            pass
+    if 'gender' not in prod_cols:
+        try:
+            cur.execute("ALTER TABLE products ADD COLUMN gender TEXT")
         except Exception:
             pass
     db.commit()
@@ -273,7 +258,23 @@ def close_connection(exception):
 def fetch_recommendations(limit=10, user_id=None, category=None, color=None, location=None, min_price=None, max_price=None):
     db = get_db()
     cur = db.cursor()
-    # Common filters: category, color, location, min_price, max_price
+    # Helper: get set of swiped product ids for user
+    def get_swiped_ids(user_id):
+        cur.execute('SELECT DISTINCT item_id FROM swipes WHERE user_id = ?', (user_id,))
+        return set([row['item_id'] for row in cur.fetchall()])
+
+    # Helper: get liked categories for user, sorted by like count desc
+    def get_liked_categories(user_id):
+        cur.execute('''
+            SELECT p.category, COUNT(*) as cnt
+            FROM swipes s JOIN products p ON s.item_id = p.id
+            WHERE s.user_id = ? AND s.action = 'like' AND p.category IS NOT NULL AND p.category != ''
+            GROUP BY p.category
+            ORDER BY cnt DESC
+        ''', (user_id,))
+        return [row['category'] for row in cur.fetchall()]
+
+    # Build filters
     def build_filters(category, color, location, min_price, max_price):
         clauses = []
         params = []
@@ -296,11 +297,9 @@ def fetch_recommendations(limit=10, user_id=None, category=None, color=None, loc
             return 'WHERE ' + ' AND '.join(clauses), tuple(params)
         return '', ()
 
-    # Build filters using passed parameters
-    filter_where, filter_params = build_filters(category, color, location, min_price, max_price)
-
+    # If no user, fallback to global logic
     if not user_id:
-        # Global ordering by score (likes - dislikes)
+        filter_where, filter_params = build_filters(category, color, location, min_price, max_price)
         sql = f'''
         SELECT p.id, p.name, p.price, p.image, p.category, p.color, p.location, p.price_num,
             IFNULL(SUM(CASE WHEN s.action='like' THEN 1 WHEN s.action='dislike' THEN -1 ELSE 0 END), 0) as score
@@ -317,50 +316,81 @@ def fetch_recommendations(limit=10, user_id=None, category=None, color=None, loc
         items = [dict(r) for r in rows]
         return items
 
-    # Personalized recommendations: combine global score, user's item score, and user's category affinity
-    # Apply same filters as global selection
-    filter_where_personal = filter_where
+    # Personalized logic
+    swiped_ids = get_swiped_ids(user_id)
+    liked_cats = get_liked_categories(user_id)
+    result = []
+    used_ids = set()
 
-    sql = f'''
-    WITH user_cat AS (
-        SELECT p.category as category, COUNT(*) as likes
-        FROM swipes s JOIN products p ON s.item_id = p.id
-        WHERE s.user_id = ? AND s.action = 'like'
-        GROUP BY p.category
-    ),
-    user_item AS (
-        SELECT item_id,
-            SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as user_score
-        FROM swipes WHERE user_id = ? GROUP BY item_id
-    ),
-    global_score AS (
-        SELECT item_id,
-            SUM(CASE WHEN action='like' THEN 1 WHEN action='dislike' THEN -1 ELSE 0 END) as gscore
-        FROM swipes GROUP BY item_id
-    )
-    SELECT p.id, p.name, p.price, p.image, p.category,
-        IFNULL(g.gscore,0) as global_score,
-        IFNULL(u.user_score,0) as user_score,
-        IFNULL(uc.likes,0) as cat_likes,
-        (IFNULL(g.gscore,0) + IFNULL(u.user_score,0)*2 + IFNULL(uc.likes,0)*1) as score
+    # 1. Recommend from liked categories, not yet swiped
+    for cat in liked_cats:
+        filter_where, filter_params = build_filters(cat, color, location, min_price, max_price)
+        sql = f"""
+        SELECT p.id, p.name, p.price, p.image, p.category, p.color, p.location, p.price_num
+        FROM products p
+        {filter_where}
+        """
+        cur.execute(sql, filter_params)
+        for row in cur.fetchall():
+            if row['id'] not in swiped_ids and row['id'] not in used_ids:
+                result.append(dict(row))
+                used_ids.add(row['id'])
+            if len(result) >= limit:
+                return result[:limit]
+
+    # 2. If not enough, recommend from other categories, not yet swiped
+    filter_where, filter_params = build_filters(None, color, location, min_price, max_price)
+    sql = f"""
+    SELECT p.id, p.name, p.price, p.image, p.category, p.color, p.location, p.price_num
     FROM products p
-    LEFT JOIN global_score g ON g.item_id = p.id
-    LEFT JOIN user_item u ON u.item_id = p.id
-    LEFT JOIN user_cat uc ON uc.category = p.category
-    {filter_where_personal}
-    ORDER BY score DESC, RANDOM()
-    LIMIT ?
-    '''
-    params = [user_id, user_id]
-    # append filter params in same order as build_filters returned
-    if filter_params:
-        params.extend(filter_params)
-    params.append(limit)
-    params = tuple(params)
-    cur.execute(sql, params)
+    {filter_where}
+    """
+    cur.execute(sql, filter_params)
+    for row in cur.fetchall():
+        if row['id'] not in swiped_ids and row['id'] not in used_ids:
+            result.append(dict(row))
+            used_ids.add(row['id'])
+        if len(result) >= limit:
+            return result[:limit]
+
+    # 3. If still not enough, recommend from liked categories (even if swiped)
+    for cat in liked_cats:
+        filter_where, filter_params = build_filters(cat, color, location, min_price, max_price)
+        sql = f"""
+        SELECT p.id, p.name, p.price, p.image, p.category, p.color, p.location, p.price_num
+        FROM products p
+        {filter_where}
+        """
+        cur.execute(sql, filter_params)
+        for row in cur.fetchall():
+            if row['id'] not in used_ids:
+                result.append(dict(row))
+                used_ids.add(row['id'])
+            if len(result) >= limit:
+                return result[:limit]
+
+    # 4. Fallback: recommend any products (even if swiped)
+    filter_where, filter_params = build_filters(None, color, location, min_price, max_price)
+    sql = f"""
+    SELECT p.id, p.name, p.price, p.image, p.category, p.color, p.location, p.price_num
+    FROM products p
+    {filter_where}
+    """
+    cur.execute(sql, filter_params)
+    for row in cur.fetchall():
+        if row['id'] not in used_ids:
+            result.append(dict(row))
+            used_ids.add(row['id'])
+        if len(result) >= limit:
+            return result[:limit]
+
+    # If still empty, re-roll: return a random sample of products (including already swiped/used ones)
+    cur.execute('SELECT id, name, price, image, category, color, location, price_num FROM products ORDER BY RANDOM() LIMIT ?', (limit,))
     rows = cur.fetchall()
-    items = [dict(r) for r in rows]
-    return items
+    return [dict(r) for r in rows]
+
+    # Always return at least some products (never empty)
+    # return result[:limit] if result else []
 
 @app.route('/recommendations')
 def recommendations():
@@ -441,35 +471,66 @@ def similar():
     top_k = int(request.args.get('k') or 6)
     db = get_db()
     cur = db.cursor()
+    category = None
     if product_id:
-        cur.execute('SELECT image FROM products WHERE id = ?', (product_id,))
+        cur.execute('SELECT image, category FROM products WHERE id = ?', (product_id,))
         row = cur.fetchone()
         if not row:
             return jsonify({"items": []})
         image_url = row['image']
+        category = row['category']
     if not image_url:
         return jsonify({"items": []})
 
-    # use image recommender (if available). If the model isn't importable
-    # (missing dependencies like numpy/keras), return an empty list so the
-    # rest of the API continues to work.
-    if image_based_recommendation is None:
-        return jsonify({"items": []}), 503
-    try:
-        recs = image_based_recommendation.recommend_from_image(image_url, top_k=top_k)
-        # recs is list of {product_id, name, image_url}
-        # augment with product DB fields where possible
-        out = []
-        for r in recs:
-            pid = r.get('product_id')
-            cur.execute('SELECT id, name, price, image, category FROM products WHERE id = ?', (pid,))
+    # 1. Category-based recommendations (excluding current product)
+    category_recs = []
+    if category:
+        cur.execute('SELECT id, name, price, image, category FROM products WHERE category = ? AND id != ?', (category, product_id))
+        category_recs = [dict(r) for r in cur.fetchall()]
+    used_ids = set([int(product_id)]) if product_id else set()
+    for r in category_recs:
+        used_ids.add(r['id'])
+
+    # 2. Image-based recommendations (excluding already included)
+    image_recs = []
+    if image_based_recommendation is not None:
+        try:
+            recs = image_based_recommendation.recommend_from_image(image_url, top_k=top_k)
+            for r in recs:
+                pid = r.get('product_id')
+                if pid and pid not in used_ids:
+                    cur.execute('SELECT id, name, price, image, category FROM products WHERE id = ?', (pid,))
+                    prow = cur.fetchone()
+                    if prow:
+                        image_recs.append(dict(prow))
+                        used_ids.add(pid)
+        except Exception as e:
+            print('image recommender error in /similar:', e)
+
+    # 3. NLP-based recommendations (excluding already included)
+    nlp_recs = []
+    if _nlp is not None and product_id:
+        try:
+            cur.execute('SELECT name, category FROM products WHERE id = ?', (product_id,))
             prow = cur.fetchone()
             if prow:
-                out.append(dict(prow))
-        return jsonify({"items": out})
-    except Exception as e:
-        print('similar error', e)
-        return jsonify({"items": []}), 500
+                query_text = f"{prow['name']} {prow.get('category','')}"
+                nlp_results = _nlp.nlp_recommend(query_text, top_k=top_k)
+                for r in nlp_results:
+                    pid = r.get('id') or r.get('product_id')
+                    if pid and pid not in used_ids:
+                        cur.execute('SELECT id, name, price, image, category FROM products WHERE id = ?', (pid,))
+                        prow2 = cur.fetchone()
+                        if prow2:
+                            nlp_recs.append(dict(prow2))
+                            used_ids.add(pid)
+        except Exception as e:
+            print('nlp recommender error in /similar:', e)
+
+    # Combine all recommendations in order: category, image, nlp
+    combined = category_recs + image_recs + nlp_recs
+    return jsonify({"items": combined})
+
 
 @app.route('/swipe', methods=['POST'])
 def swipe():
@@ -483,80 +544,9 @@ def swipe():
     user_id = data.get('user_id')
     if action not in ('like','dislike') or item_id is None:
         return jsonify({"error":"invalid payload"}), 400
-    db = get_db()
-    cur = db.cursor()
-    cur.execute('INSERT INTO swipes(item_id, action, user_id, item_image) VALUES (?,?,?,?)', (item_id, action, user_id, item_image))
-    db.commit()
-
-    # Run image-based recommender (ensure features exist). If the image-based
-    # module is available, ensure feature cache is present; generate in a
-    # background thread if extraction may take long so we don't block the swipe.
-    image_recs = []
-    nlp_recs = []
-    try:
-        if image_based_recommendation is not None:
-            # ensure feature cache exists; run in background if missing
-            def ensure_and_run():
-                try:
-                    image_based_recommendation.ensure_features_exist()
-                except Exception as _:
-                    pass
-            # start background sync (non-blocking)
-            t = threading.Thread(target=ensure_and_run, daemon=True)
-            t.start()
-            # attempt a best-effort recommend from the swiped item's image
-            cur.execute('SELECT image FROM products WHERE id = ?', (item_id,))
-            prow = cur.fetchone()
-            if prow and prow['image']:
-                try:
-                    image_recs = image_based_recommendation.recommend_from_image(prow['image'], top_k=6)
-                except Exception as e:
-                    print('image recommender error on swipe:', e)
-
-        # NLP recommender: attempt to call with product name/category/description
-        if _nlp is not None:
-            cur.execute('SELECT name, category FROM products WHERE id = ?', (item_id,))
-            prow = cur.fetchone()
-            if prow:
-                query_text = f"{prow['name']} {prow.get('category','')}"
-                try:
-                    nlp_results = _nlp.nlp_recommend(query_text, top_k=6, user_id=user_id)
-                    nlp_recs = nlp_results
-                except Exception as e:
-                    print('nlp recommender error on swipe:', e)
-    except Exception as e:
-        print('recommender error on swipe:', e)
-
-    # Combine and dedupe recommendations (image-based returns product_id; NLP returns product dicts)
-    combined = []
-    seen = set()
-    for r in (image_recs or []):
-        pid = r.get('product_id')
-        if pid and pid not in seen and pid != item_id:
-            cur.execute('SELECT id,name,price,image,category FROM products WHERE id = ?', (pid,))
-            prow = cur.fetchone()
-            if prow:
-                combined.append(dict(prow))
-                seen.add(pid)
-    for r in (nlp_recs or []):
-        pid = r.get('id') or r.get('product_id')
-        if pid and pid not in seen and pid != item_id:
-            # if NLP returns product dicts with id use those; otherwise try to lookup by name
-            if 'id' in r:
-                cur.execute('SELECT id,name,price,image,category FROM products WHERE id = ?', (r['id'],))
-                prow = cur.fetchone()
-                if prow:
-                    combined.append(dict(prow))
-                    seen.add(r['id'])
-            else:
-                # fallback: match by name
-                cur.execute('SELECT id,name,price,image,category FROM products WHERE name = ? LIMIT 1', (r.get('name') or r.get('title'),))
-                prow = cur.fetchone()
-                if prow and prow['id'] not in seen:
-                    combined.append(dict(prow))
-                    seen.add(prow['id'])
-
-    return jsonify({"status":"ok","recommendations": combined})
+    recs = recommend_from_image(item_image, top_k=5) if image_based_recommendation is not None and item_image else ([],[])
+    combined=[]
+    return jsonify({"status":"ok","recommendations": recs})
 
 
 @app.route('/admin/extract_features', methods=['POST'])
@@ -610,6 +600,77 @@ def admin_extract_progress():
     except Exception as e:
         print('progress read error', e)
         return jsonify({"status":"unknown"}), 500
+
+@app.route('/admin/reset_db', methods=['POST'])
+def admin_reset_db():
+    """Dangerous: Drop all tables and re-initialize the database."""
+    db = get_db()
+    cur = db.cursor()
+    # Get all table names
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row['name'] for row in cur.fetchall()]
+    for table in tables:
+        if table.startswith('sqlite_'):
+            continue  # skip SQLite internal tables
+        cur.execute(f"DROP TABLE IF EXISTS {table}")
+    db.commit()
+    # Re-initialize
+    init_db()
+    return jsonify({'status': 'ok', 'message': 'Database reset and re-initialized.'})
+
+@app.route('/create_user', methods=['POST'])
+def create_user():
+    data = request.get_json() or {}
+    name = data.get('name')
+    user_id = data.get('id') or str(uuid4())
+    if not name:
+        return jsonify({'error': 'Name is required'}), 400
+    db = get_db()
+    cur = db.cursor()
+    try:
+        cur.execute('INSERT INTO users(id, name) VALUES (?, ?)', (user_id, name))
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'User ID already exists'}), 400
+    return jsonify({'id': user_id, 'name': name})
+
+@app.route('/users', methods=['GET'])
+def list_users():
+    db = get_db()
+    cur = db.cursor()
+    cur.execute('SELECT id, name FROM users ORDER BY created_at DESC')
+    users = [dict(row) for row in cur.fetchall()]
+    return jsonify({'users': users})
+
+# Gender categorization utility
+GENDER_KEYWORDS = {
+    'male': ['men', 'man', 'male', 'boy', 'guys', 'gentlemen', 'mens', 'boys'],
+    'female': ['women', 'woman', 'female', 'girl', 'ladies', 'womens', 'girls', 'lady'],
+}
+def infer_gender(text):
+    if not text:
+        return 'unknown'
+    t = text.lower()
+    for gender, keywords in GENDER_KEYWORDS.items():
+        for kw in keywords:
+            if kw in t:
+                return gender
+    return 'unknown'
+
+@app.route('/admin/categorize_gender', methods=['POST'])
+def admin_categorize_gender():
+    db = get_db()
+    cur = db.cursor()
+    cur.execute('SELECT id, name, category FROM products')
+    products = cur.fetchall()
+    updated = 0
+    for p in products:
+        text = f"{p['name']} {p['category']}"
+        gender = infer_gender(text)
+        cur.execute('UPDATE products SET gender = ? WHERE id = ?', (gender, p['id']))
+        updated += 1
+    db.commit()
+    return jsonify({'status': 'ok', 'updated': updated})
 
 if __name__ == '__main__':
     # ensure DB folder exists

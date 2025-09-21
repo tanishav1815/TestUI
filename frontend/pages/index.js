@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import useSWR from 'swr'
+import React from 'react'
 
 const fetcher = (url) => fetch(url).then(r=>r.json())
 // When running locally, allow the client to call the Flask backend directly
@@ -86,7 +87,29 @@ function Card({ item, onSwipe, favorites, toggleFavorite }){
 }
 
 export default function Home(){
-  const USER_ID = process.env.NEXT_PUBLIC_USER_ID || 'anonymous'
+  // User switching logic
+  const [users, setUsers] = useState([])
+  const [newUserName, setNewUserName] = useState('')
+  const [userId, setUserId] = useState('')
+  const [hydrated, setHydrated] = useState(false)
+  useEffect(() => {
+    setHydrated(true)
+    // Only run on client
+    const stored = localStorage.getItem('user_id')
+    if (stored) setUserId(stored)
+  },[])
+  useEffect(() => {
+    if (userId) localStorage.setItem('user_id', userId)
+  }, [userId])
+  useEffect(() => {
+    fetch(`${BACKEND}/users`).then(r => r.json()).then(data => {
+      setUsers(data.users || [])
+    })
+  },[])
+  useEffect(()=>{
+    try{ const saved = JSON.parse(localStorage.getItem('favorites')||'[]'); setFavorites(saved) }catch(e){}
+  },[])
+
   const [selectedCategory, setSelectedCategory] = useState('')
   const [colorFilter, setColorFilter] = useState('')
   const [locationFilter, setLocationFilter] = useState('')
@@ -94,13 +117,13 @@ export default function Home(){
   const [maxPriceFilter, setMaxPriceFilter] = useState('')
   const swrKey = () => {
     const params = new URLSearchParams()
+    if(userId) params.set('user_id', userId)
     if(selectedCategory) params.set('category', selectedCategory)
     if(colorFilter) params.set('color', colorFilter)
     if(locationFilter) params.set('location', locationFilter)
     if(minPriceFilter) params.set('min_price', minPriceFilter)
     if(maxPriceFilter) params.set('max_price', maxPriceFilter)
     const qs = params.toString()
-    // call backend directly from the browser (avoids server-side proxy issues)
     return `${BACKEND}/recommendations${qs? '?'+qs : ''}`
   }
   const {data, error, mutate} = useSWR(swrKey, fetcher, {refreshInterval:0})
@@ -115,9 +138,6 @@ export default function Home(){
   const [favorites, setFavorites] = useState(() => {
     try{ return JSON.parse(localStorage.getItem('favorites')||'[]') }catch(e){ return [] }
   })
-  useEffect(()=>{
-    try{ const saved = JSON.parse(localStorage.getItem('favorites')||'[]'); setFavorites(saved) }catch(e){}
-  },[])
 
   function toggleFavorite(id){
     setFavorites(prev => {
@@ -125,6 +145,24 @@ export default function Home(){
       try{ localStorage.setItem('favorites', JSON.stringify(next)) }catch(e){}
       return next
     })
+  }
+
+  async function handleCreateUser() {
+    if (!newUserName.trim()) return;
+    const resp = await fetch(`${BACKEND}/create_user`, {
+      method: 'POST',
+      headers: {'content-type':'application/json'},
+      body: JSON.stringify({ name: newUserName })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      setUserId(data.id);
+      setNewUserName('');
+      // refresh user list
+      fetch(`${BACKEND}/users`).then(r => r.json()).then(data => {
+        setUsers(data.users || []);
+      });
+    }
   }
 
   useEffect(()=>{
@@ -142,7 +180,7 @@ export default function Home(){
   async function handleSwipe(action, item){
     // send to backend
     try{
-      const resp = await fetch(`${BACKEND}/swipe`, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({action, user_id: USER_ID, item_id: item.id, image: item.image})})
+      const resp = await fetch(`${BACKEND}/swipe`, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({action, user_id: userId, item_id: item.id, image: item.image})})
       // if backend returns recommendations, push them to top of stack
       if(resp && resp.ok){
         const body = await resp.json()
@@ -218,7 +256,25 @@ export default function Home(){
   },[stack])
 
   return (
-    <div className="container">
+    <div>
+      <div style={{marginBottom:20, padding:10, borderBottom:'1px solid #eee'}}>
+        <label>User:&nbsp;
+          {hydrated ? (
+            <select value={userId} onChange={e => setUserId(e.target.value)}>
+              <option value="">-- Select User --</option>
+              {users.map(u => <option key={u.id} value={u.id}>{u.name} ({u.id.slice(0,6)})</option>)}
+            </select>
+          ) : (
+            <span>Loading users...</span>
+          )}
+        </label>
+        <span style={{marginLeft:10}}>
+          <input placeholder="New user name" value={newUserName} onChange={e=>setNewUserName(e.target.value)} />
+          <button onClick={handleCreateUser}>Create User</button>
+        </span>
+        {hydrated && userId && <span style={{marginLeft:20, color:'#888'}}>Current user: {users.find(u=>u.id===userId)?.name || userId}</span>}
+      </div>
+      <div className="container">
       <div className="category-bar" style={{display:'flex',gap:8,flexWrap:'wrap',marginBottom:12}}>
         <button className={`cat ${selectedCategory===''? 'active':''}`} onClick={()=>setSelectedCategory('')}>All</button>
         {(catData && Array.isArray(catData.categories) ? catData.categories : []).map(c=> (
@@ -274,9 +330,9 @@ export default function Home(){
               {searchLoading && <div style={{display:'flex',justifyContent:'center',padding:12}}><div className="spinner" /></div>}
               <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(180px,1fr))',gap:12}}>
                 {searchResults.map(s=> (
-                  <div key={s.id} className="result-card" style={{position:'relative'}} onClick={()=>{
-                    // push selected search item to top of stack and fetch similar
-                    setStack(curr => [s].concat(Array.isArray(curr)?curr:[]))
+                  <div key={s.id} className="result-card" style={{position:'relative'}} onClick={() => {
+                    // push selected search item to top of stack and fetch similar, avoid duplicates
+                    setStack(curr => [s, ...(Array.isArray(curr) ? curr.filter(item => item.id !== s.id) : [])])
                     loadSimilar(s.id)
                   }}>
                     <img src={s.image} alt={s.name} className="thumb" />
@@ -294,6 +350,7 @@ export default function Home(){
         <button className="btn btn-dislike" aria-label="dislike" onClick={()=>doButtonSwipe('dislike')}>Nope</button>
         <button className="btn btn-like" aria-label="like" onClick={()=>doButtonSwipe('like')}>Like</button>
       </div>
+    </div>
     </div>
   )
 }
